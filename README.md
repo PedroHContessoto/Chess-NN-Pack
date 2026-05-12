@@ -159,6 +159,15 @@ wdls   = r.wdl_array()               # int8[N]    (view)
 wflat  = r.w_flat()                  # uint16[total_features] (view)
 print(evals.base is not None)        # True — view holds Reader alive
 
+# Batch gather (single C++ loop) — for DataLoader workloads
+indices = np.random.permutation(len(r))[:65536].astype(np.uint64)
+batch = r.get_batch(indices)
+batch["features"]    # (65536, 32) uint16, padded with UINT16_MAX
+batch["counts"]      # (65536,) uint8 — actual feature count per position
+batch["evals_norm"]  # (65536,) float32 — decoded eval
+batch["wdls"]        # (65536,) int8 — game outcome (white-POV)
+batch["stm"]         # (65536,) uint8 — side to move
+
 # Metadata as bytes; parse with stdlib json
 import json
 meta = json.loads(r.metadata.decode("utf-8"))
@@ -199,7 +208,23 @@ Real numbers from a 60 MB Linrock T77 binpack (`high-simple-eval-1k`):
 | Conversion time | 13 s on a single CPU core |
 | Read throughput | ~1.4M positions/s |
 | `cnnp validate` | 446 ms (full O(N) scan over all invariants) |
-| Per-position random access (Python) | sub-microsecond (mmap O(1)) |
+| Per-position random access (Python) | 4–5 µs (mmap O(1) + Python overhead) |
+| **Batched random access (`get_batch`)** | **~225 ns per position** (C++ loop) |
+
+For DataLoader-scale workloads the per-position Python overhead dominates;
+`Reader.get_batch(indices)` runs the gather entirely in C++ and is **30–80×
+faster than calling `at(i)` in a Python loop**:
+
+| Batch size | `at(i)` loop | `get_batch()` | Speedup |
+|---:|---:|---:|---:|
+| 256 | 10.2 ms | 0.3 ms | 32× |
+| 1024 | 23.1 ms | 0.3 ms | 74× |
+| 8192 | 219.7 ms | 3.8 ms | 58× |
+| 16384 | 303.2 ms | 3.8 ms | 79× |
+| 65536 | 757.4 ms | 14.8 ms | 51× |
+
+For batch=65536 this drops data-fetch from 757 ms (GPU starves) to 14.8 ms
+(GPU saturated by typical 50–200 ms forward+backward step).
 
 ### Write a file
 

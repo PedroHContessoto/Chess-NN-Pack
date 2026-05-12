@@ -238,6 +238,90 @@ def test_at_out_of_range(r):
         except OSError: pass
 
 
+def test_get_batch(r):
+    section("get_batch (C++ batch gather)")
+    with tempfile.NamedTemporaryFile(suffix=".cnnp", delete=False) as f:
+        path = f.name
+    try:
+        make_sample(path)
+        rdr = cnnp.Reader(path)
+
+        # Indices: 0, 2, 1, 3 (out of order to test gather semantics)
+        idx = np.array([0, 2, 1, 3], dtype=np.uint64)
+        batch = rdr.get_batch(idx)
+
+        r.record("returns dict",
+                 isinstance(batch, dict))
+        r.record("dict has 6 keys",
+                 set(batch.keys()) == {"features", "counts", "evals_raw",
+                                        "evals_norm", "wdls", "stm"})
+        r.record("features shape (4, 32)",
+                 batch["features"].shape == (4, 32))
+        r.record("features dtype uint16",
+                 batch["features"].dtype == np.uint16)
+        r.record("counts shape (4,)", batch["counts"].shape == (4,))
+        r.record("counts dtype uint8", batch["counts"].dtype == np.uint8)
+        r.record("evals_raw dtype int16",
+                 batch["evals_raw"].dtype == np.int16)
+        r.record("evals_norm dtype float32",
+                 batch["evals_norm"].dtype == np.float32)
+        r.record("wdls dtype int8",  batch["wdls"].dtype == np.int8)
+        r.record("stm dtype uint8",  batch["stm"].dtype == np.uint8)
+
+        # Correctness vs per-position at(i)
+        for k, i in enumerate(idx):
+            v = rdr.at(int(i))
+            if (batch["counts"][k] != v.piece_count or
+                batch["stm"][k]    != v.stm or
+                batch["wdls"][k]   != v.wdl or
+                abs(batch["evals_norm"][k] - v.eval_normalized) > 1e-6 or
+                not np.array_equal(batch["features"][k, :v.piece_count],
+                                   v.features)):
+                r.record(f"at({i}) matches batch[{k}]", False)
+                break
+        else:
+            r.record("4 positions match per-position at()", True)
+
+        # Padding sentinel
+        for k, i in enumerate(idx):
+            pc = int(batch["counts"][k])
+            if pc < 32:
+                if not (batch["features"][k, pc:] == 65535).all():
+                    r.record(f"padding sentinel for pos {k}", False)
+                    break
+        else:
+            r.record("padding sentinel == UINT16_MAX in unused slots", True)
+
+        # Out-of-range raises
+        try:
+            rdr.get_batch(np.array([rdr.num_positions], dtype=np.uint64))
+            r.record("out-of-range raises", False)
+        except IndexError:
+            r.record("out-of-range raises IndexError", True)
+        except Exception as e:
+            r.record("out-of-range raises IndexError", False,
+                     f"got {type(e).__name__}")
+
+        # Accepts non-uint64 dtypes (forcecast)
+        try:
+            batch2 = rdr.get_batch(np.array([0, 1], dtype=np.int32))
+            r.record("accepts int32 indices (forcecast)",
+                     batch2["features"].shape == (2, 32))
+        except Exception as e:
+            r.record("accepts int32 indices (forcecast)", False, str(e))
+
+        # Accepts Python list
+        try:
+            batch3 = rdr.get_batch([0, 1, 2])
+            r.record("accepts Python list",
+                     batch3["features"].shape == (3, 32))
+        except Exception as e:
+            r.record("accepts Python list", False, str(e))
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+
 def test_max_in_memory_bytes_guardrail(r):
     section("max_in_memory_bytes guardrail")
     # Cap at 1024 bytes — way less than one block's prefix (2050B).
@@ -306,6 +390,7 @@ def main():
         test_header_dict(r)
         test_validation_errors(r)
         test_at_out_of_range(r)
+        test_get_batch(r)
         test_max_in_memory_bytes_guardrail(r)
         test_module_validate_helper(r)
     except Exception:
