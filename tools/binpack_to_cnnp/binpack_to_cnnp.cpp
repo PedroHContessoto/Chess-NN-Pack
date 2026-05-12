@@ -7,11 +7,13 @@
 //   binpack_to_cnnp <in.binpack> <out.cnnp> [options]
 //
 // Options:
-//   --max-positions N     stop after N kept positions (0 = unlimited, default)
-//   --no-filter           skip the Stockfish-style filter (keep captures + in-check)
-//   --metadata-json '..'  custom JSON trailer (default: minimal spec-compliant)
-//   --report-every N      progress line every N read positions (default 1_000_000)
-//   --quiet               suppress progress reporting
+//   --max-positions N      stop after N kept positions (0 = unlimited, default)
+//   --no-filter            skip the Stockfish-style filter (keep captures + in-check)
+//   --metadata-json '..'   custom JSON trailer (default: minimal spec-compliant)
+//   --report-every N       progress line every N read positions (default 1_000_000)
+//   --max-mem-gb N         in-memory writer cap (default 32 GB; raise for ≥1B
+//                          positions on high-RAM machines, e.g. --max-mem-gb 64)
+//   --quiet                suppress progress reporting
 //
 // PERFORMANCE NOTE
 // ────────────────
@@ -77,6 +79,8 @@ void print_usage(std::ostream& os) {
         "  --no-filter            keep captures and in-check positions\n"
         "  --metadata-json '..'   custom UTF-8 JSON trailer\n"
         "  --report-every N       progress line every N read positions (0 = off)\n"
+        "  --max-mem-gb N         writer in-memory cap in gigabytes (default 32;\n"
+        "                         raise for ≥1B positions on high-RAM machines)\n"
         "  --quiet                suppress all progress output\n"
         "  -h, --help             show this help\n"
         "\n"
@@ -122,6 +126,7 @@ int main(int argc, char** argv) {
     std::uint64_t report_every = 1'000'000;
     bool          quiet = false;
     std::string   metadata_json;  // empty → Writer auto-fills with default
+    std::uint64_t max_mem_gb = 32;  // default cap for the in-memory writer
 
     for (int i = 3; i < argc; ++i) {
         const std::string_view a(argv[i]);
@@ -146,6 +151,11 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: --report-every expects a non-negative integer\n";
                 return EXIT_USAGE;
             }
+        } else if (a == "--max-mem-gb") {
+            if (!parse_u64(need_arg("--max-mem-gb"), max_mem_gb) || max_mem_gb == 0) {
+                std::cerr << "Error: --max-mem-gb expects a positive integer\n";
+                return EXIT_USAGE;
+            }
         } else if (a == "--quiet") {
             quiet = true;
         } else {
@@ -167,9 +177,13 @@ int main(int argc, char** argv) {
     // ─── Set up the CNNP writer ──────────────────────────────────────────────
     cnnp::WriterConfig cfg;
     if (!metadata_json.empty()) cfg.metadata_json = metadata_json;
-    // Defensive cap: 32 GB. Most reasonable training datasets fit; this
-    // catches accidental mass-conversion before bad_alloc.
-    cfg.max_in_memory_bytes = 32ull * (1ull << 30);
+    // Defensive cap (configurable). Catches accidental mass-conversion
+    // before bad_alloc. Raise via --max-mem-gb on high-RAM machines.
+    cfg.max_in_memory_bytes = max_mem_gb * (1ull << 30);
+    if (!quiet) {
+        std::cerr << "Writer in-memory cap: " << max_mem_gb
+                  << " GB (override with --max-mem-gb)\n";
+    }
 
     cnnp::Writer writer;
     try {
