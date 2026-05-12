@@ -132,8 +132,13 @@ def bench_data_only(path: str, batch_size: int, max_batches: int | None,
 
     ds = CNNPBatchedDataset(path, batch_size=batch_size)
     if num_workers > 0:
+        # collate_fn=identity: each batch is already a dict of NumPy arrays
+        # (cnnp.Reader.get_batch output). Without this override, PyTorch's
+        # default collate converts NumPy → torch.Tensor automatically, which
+        # then breaks the explicit `torch.from_numpy(...)` calls below.
         loader = DataLoader(ds, batch_size=None, num_workers=num_workers,
-                            persistent_workers=True)
+                            persistent_workers=True,
+                            collate_fn=lambda x: x)
     else:
         loader = ds  # iterate directly, no DataLoader wrapping
 
@@ -268,6 +273,10 @@ def main():
     else:
         print(f"  ✓ Compute-bound. Data pipeline keeps up "
               f"({r2['fetch_pct']:.1f}% fetch vs {r2['gpu_pct']:.1f}% compute).")
+    if args.num_workers > 0:
+        print(f"  Note: num_workers > 0 has IPC + process-spawn overhead. "
+              f"For very fast fetch (~5 ms/batch) the overhead can exceed "
+              f"the parallelism benefit; --num-workers 0 is often fastest.")
 
 
 if __name__ == "__main__":
