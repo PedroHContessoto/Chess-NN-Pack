@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -63,8 +65,13 @@ inline ValidFile make_valid_file(std::uint64_t n_positions = 4,
     const std::uint64_t prefix_bytes =
         static_cast<std::uint64_t>(h.num_blocks) * (h.block_size + 1) * 2;
     h.w_flat_offset        = round_up(h.block_prefix_offset  + prefix_bytes, 2);
+    // Spec §6 + §12 require a non-empty UTF-8 JSON trailer. The fixture
+    // emits the minimal spec-compliant document (50 bytes) so that
+    // tests share the same invariants as files written by `Writer`.
+    constexpr std::string_view DEFAULT_METADATA =
+        R"({"format":"cnnp_sparse_v2","layout":"single_file"})";
     h.metadata_offset      = h.w_flat_offset + h.num_features_total * 2;
-    h.metadata_length      = 0;
+    h.metadata_length      = DEFAULT_METADATA.size();
 
     const std::uint64_t file_size = h.metadata_offset + h.metadata_length;
     std::vector<std::byte> bytes(file_size, std::byte{0});
@@ -117,6 +124,10 @@ inline ValidFile make_valid_file(std::uint64_t n_positions = 4,
         write_u16_le(bytes, h.w_flat_offset + k * 2,
                      static_cast<std::uint16_t>(k % max_feature_id));
     }
+
+    // metadata trailer (UTF-8 JSON; spec §6)
+    std::memcpy(bytes.data() + h.metadata_offset,
+                DEFAULT_METADATA.data(), DEFAULT_METADATA.size());
 
     return ValidFile{h, std::move(bytes)};
 }

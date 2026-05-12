@@ -67,27 +67,38 @@ struct DecodedFlags {
 [[nodiscard]] float normalize_target(std::int32_t score_cp) noexcept;
 
 /// Encode a normalized target into i16 storage. The value is clamped
-/// to [-storage_target_clip, +storage_target_clip] before scaling, then
-/// rounded to nearest and clamped again to the i16 representable range
-/// as a safety net (if the caller passes inconsistent parameters).
+/// to [-storage_target_clip, +storage_target_clip] before scaling and
+/// rounded to nearest.
+///
+/// Throws `EncodeError` on:
+///   - non-finite `target_normalized` (NaN, ±inf)
+///   - non-finite or non-positive `fixed_scale`
+///   - non-finite or non-positive `storage_target_clip`
+///   - `storage_target_clip * fixed_scale > 32767` (would overflow i16)
+///
+/// The previous "safety clamp" behavior was removed: silent saturation
+/// on inconsistent parameters is unsafe for training data — preferring
+/// loud failure makes upstream bugs visible.
 [[nodiscard]] std::int16_t encode_eval(
     float target_normalized,
     float fixed_scale         = CNNP_FIXED_SCALE,
     float storage_target_clip = CNNP_STORAGE_TARGET_CLIP
-) noexcept;
+);
 
 /// Decode an i16 back into the normalized target space.
+/// Throws `EncodeError` if `fixed_scale` is non-finite or non-positive.
 [[nodiscard]] float decode_eval(
     std::int16_t eval_i16,
     float fixed_scale = CNNP_FIXED_SCALE
-) noexcept;
+);
 
 /// Convenience: cp → i16 in one call (normalize + encode).
+/// Propagates any `EncodeError` from `encode_eval`.
 [[nodiscard]] std::int16_t encode_eval_from_cp(
     std::int32_t score_cp,
     float fixed_scale         = CNNP_FIXED_SCALE,
     float storage_target_clip = CNNP_STORAGE_TARGET_CLIP
-) noexcept;
+);
 
 // ─── wdl_i8 ───────────────────────────────────────────────────────────────────
 //

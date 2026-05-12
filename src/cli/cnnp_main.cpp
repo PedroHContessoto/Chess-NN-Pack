@@ -22,6 +22,8 @@
 
 #include "cnnp/cnnp.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -61,26 +63,63 @@ void print_usage(std::ostream& os) {
 
 // ─── validate ────────────────────────────────────────────────────────────────
 
-int cmd_validate(const std::filesystem::path& path) {
-    try {
-        // Reader::open runs parse_header + validate_full.
-        auto r = cnnp::Reader::open(path);
-        std::cout << "OK  " << path.string()
-                  << "  num_positions=" << r.num_positions()
-                  << "  num_blocks="    << r.num_blocks()
-                  << "  num_features="  << r.header().num_features_total
-                  << "  metadata="      << r.header().metadata_length << "B\n";
-        return EXIT_OK;
-    } catch (const cnnp::MmapError& e) {
-        std::cerr << "FAIL (mmap): " << e.what() << "\n";
-        return EXIT_FILE;
-    } catch (const cnnp::ParseError& e) {
-        std::cerr << "FAIL (header parse): " << e.what() << "\n";
-        return EXIT_VALIDATION;
-    } catch (const cnnp::ValidationError& e) {
-        std::cerr << "FAIL (validator): " << e.what() << "\n";
-        return EXIT_VALIDATION;
+// Full JSON validation of the metadata trailer (spec §6 + §12 require
+// it to be valid UTF-8 JSON containing the `format` and `layout` fields).
+// Uses nlohmann/json — a CLI-only dependency; the core library remains
+// dependency-free per spec §12.
+void validate_metadata_json(std::span<const std::byte> md) {
+    if (md.empty()) {
+        throw cnnp::ValidationError(
+            "metadata trailer is empty (spec §6 requires UTF-8 JSON)");
     }
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(md.begin(), md.end());
+    } catch (const nlohmann::json::parse_error& e) {
+        throw cnnp::ValidationError(
+            std::string("metadata is not valid JSON: ") + e.what());
+    }
+    if (!j.is_object()) {
+        throw cnnp::ValidationError(
+            "metadata is JSON but not an object (spec requires {...})");
+    }
+
+    const auto fmt_it = j.find("format");
+    if (fmt_it == j.end() || !fmt_it->is_string()) {
+        throw cnnp::ValidationError(
+            "metadata missing required string field \"format\"");
+    }
+    if (fmt_it->get<std::string>() != "cnnp_sparse_v2") {
+        throw cnnp::ValidationError(
+            "metadata \"format\" must equal \"cnnp_sparse_v2\"; got \""
+            + fmt_it->get<std::string>() + "\"");
+    }
+
+    const auto layout_it = j.find("layout");
+    if (layout_it == j.end() || !layout_it->is_string()) {
+        throw cnnp::ValidationError(
+            "metadata missing required string field \"layout\"");
+    }
+    if (layout_it->get<std::string>() != "single_file") {
+        throw cnnp::ValidationError(
+            "metadata \"layout\" must equal \"single_file\" in V2; got \""
+            + layout_it->get<std::string>() + "\"");
+    }
+}
+
+int cmd_validate(const std::filesystem::path& path) {
+    // Reader::open runs parse_header + validate_full (binary layer).
+    // Then we additionally parse and check the JSON metadata trailer.
+    auto r = cnnp::Reader::open(path);
+    validate_metadata_json(r.metadata());
+
+    std::cout << "OK  " << path.string()
+              << "  num_positions=" << r.num_positions()
+              << "  num_blocks="    << r.num_blocks()
+              << "  num_features="  << r.header().num_features_total
+              << "  metadata="      << r.header().metadata_length << "B\n";
+    return EXIT_OK;
 }
 
 // ─── inspect ─────────────────────────────────────────────────────────────────
@@ -101,7 +140,8 @@ int cmd_inspect(const std::filesystem::path& path) {
     std::cout << "─── CNNP V" << h.version << " — " << path.string() << " ───\n";
 
     std::cout << "Identity:\n"
-              << "  magic                : CNN" << h.version << "\n"
+              << "  magic                : CNN2\n"
+              << "  version              : " << h.version << "\n"
               << "  header_size          : " << h.header_size << "\n"
               << "  endian               : little\n"
               << "  layout_kind          : single_file\n";
@@ -271,6 +311,15 @@ int main(int argc, char** argv) {
         std::cerr << "Error: unknown subcommand '" << cmd << "'\n\n";
         print_usage(std::cerr);
         return EXIT_USAGE;
+    } catch (const cnnp::MmapError& e) {
+        std::cerr << "Error (mmap): " << e.what() << "\n";
+        return EXIT_FILE;
+    } catch (const cnnp::ParseError& e) {
+        std::cerr << "Error (header parse): " << e.what() << "\n";
+        return EXIT_VALIDATION;
+    } catch (const cnnp::ValidationError& e) {
+        std::cerr << "Error (validator): " << e.what() << "\n";
+        return EXIT_VALIDATION;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return EXIT_FILE;

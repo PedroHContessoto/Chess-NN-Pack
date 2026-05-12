@@ -10,8 +10,10 @@
 #include "cnnp/validator.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -20,6 +22,14 @@ namespace cnnp {
 
 namespace {
 
+// TODO(streaming-writer): when this file's logic is reused in a
+// streaming writer, an external converter, or anywhere the inputs
+// aren't already bounded by std::vector capacity, replace this with
+// a checked variant that validates `a` is a power of two and that
+// `v + (a-1)` doesn't overflow. Today every caller passes offsets
+// derived from in-RAM array sizes, so overflow is physically blocked
+// by std::vector's allocation limits — but the moment that invariant
+// goes away, the unchecked form becomes a footgun.
 constexpr std::uint64_t round_up(std::uint64_t v, std::uint64_t a) {
     return (v + (a - 1)) & ~(a - 1);
 }
@@ -35,20 +45,36 @@ Writer::Writer(WriterConfig cfg) : m_cfg(std::move(cfg)) {
         // V2 supports HalfP only (count_semantics = piece_count == nnz).
         throw WriteError("Writer: only FeatureSet::HalfP is supported in V2");
     }
-    if (m_cfg.block_size == 0) {
-        throw WriteError("Writer: block_size must be > 0");
+    // V2 fixes block_size, max_count, and count_base. Reject non-conforming
+    // values immediately at construction time rather than letting the
+    // validator catch them later in finalize() — fail-fast UX.
+    if (m_cfg.block_size != CNNP_BLOCK_SIZE) {
+        throw WriteError("Writer: V2 requires block_size == " +
+                         std::to_string(CNNP_BLOCK_SIZE) +
+                         "; got " + std::to_string(m_cfg.block_size));
     }
-    if (m_cfg.max_count < 2 || m_cfg.max_count > 32) {
-        throw WriteError("Writer: max_count must be in [2, 32]");
+    if (m_cfg.max_count != CNNP_MAX_COUNT) {
+        throw WriteError("Writer: V2 requires max_count == " +
+                         std::to_string(CNNP_MAX_COUNT) +
+                         "; got " + std::to_string(m_cfg.max_count));
+    }
+    if (m_cfg.count_base != CNNP_COUNT_BASE) {
+        throw WriteError("Writer: V2 requires count_base == " +
+                         std::to_string(CNNP_COUNT_BASE) +
+                         "; got " + std::to_string(m_cfg.count_base));
     }
     if (m_cfg.max_feature_id == 0) {
         throw WriteError("Writer: max_feature_id must be > 0");
     }
-    if (m_cfg.fixed_scale <= 0.0f) {
-        throw WriteError("Writer: fixed_scale must be positive");
+    // isfinite catches NaN/inf — `<= 0` returns false for NaN, letting it slip.
+    if (!std::isfinite(m_cfg.fixed_scale) || m_cfg.fixed_scale <= 0.0f) {
+        throw WriteError("Writer: fixed_scale must be finite and > 0");
     }
-    if (m_cfg.storage_target_clip <= 0.0f) {
-        throw WriteError("Writer: storage_target_clip must be positive");
+    if (!std::isfinite(m_cfg.normal_eval_clip) || m_cfg.normal_eval_clip <= 0.0f) {
+        throw WriteError("Writer: normal_eval_clip must be finite and > 0");
+    }
+    if (!std::isfinite(m_cfg.storage_target_clip) || m_cfg.storage_target_clip <= 0.0f) {
+        throw WriteError("Writer: storage_target_clip must be finite and > 0");
     }
 }
 
@@ -154,10 +180,63 @@ void Writer::finalize(const std::filesystem::path& path) {
     const std::uint64_t prefix_bytes =
         static_cast<std::uint64_t>(h.num_blocks) * (h.block_size + 1) * 2;
     h.w_flat_offset        = round_up(h.block_prefix_offset + prefix_bytes, 2);
+    // Spec §6 + §12 require a non-empty UTF-8 JSON trailer. If the user
+    // supplied an empty string, fall back to the minimal spec-compliant
+    // document so the Writer never produces a non-conforming file.
+    static const std::string DEFAULT_METADATA =
+        R"({"format":"cnnp_sparse_v2","layout":"single_file"})";
+    const std::string& effective_metadata =
+        m_cfg.metadata_json.empty() ? DEFAULT_METADATA : m_cfg.metadata_json;
+
+    // Lexical sanity check on user-supplied metadata when validate is on.
+    // This is intentionally weaker than the CLI's nlohmann/json parse —
+    // the core stays dependency-free, so we catch the obvious shape errors
+    // (not a JSON object, missing required fields) without parsing JSON.
+    // The default metadata above is hard-coded valid; only user-provided
+    // strings need checking.
+    if (m_cfg.validate && !m_cfg.metadata_json.empty()) {
+        const std::string_view md = effective_metadata;
+        if (md.front() != '{' || md.back() != '}') {
+            throw WriteError(
+                "Writer: metadata_json is not a JSON object "
+                "(must start with '{' and end with '}')");
+        }
+        if (md.find("format") == std::string_view::npos ||
+            md.find("cnnp_sparse_v2") == std::string_view::npos) {
+            throw WriteError(
+                "Writer: metadata_json missing required \"format\":\"cnnp_sparse_v2\"");
+        }
+        if (md.find("layout") == std::string_view::npos ||
+            md.find("single_file") == std::string_view::npos) {
+            throw WriteError(
+                "Writer: metadata_json missing required \"layout\":\"single_file\"");
+        }
+    }
+
     h.metadata_offset      = h.w_flat_offset + h.num_features_total * 2;
-    h.metadata_length      = m_cfg.metadata_json.size();
+    h.metadata_length      = effective_metadata.size();
 
     const std::uint64_t file_size = h.metadata_offset + h.metadata_length;
+
+    // Optional user-defined memory guardrail. Throws BEFORE allocation so
+    // the caller gets a clear "your dataset outgrew the in-memory writer"
+    // error rather than a system-level bad_alloc later.
+    if (m_cfg.max_in_memory_bytes > 0 &&
+        file_size > m_cfg.max_in_memory_bytes) {
+        throw WriteError("Writer::finalize: file_size " +
+                         std::to_string(file_size) +
+                         " exceeds max_in_memory_bytes " +
+                         std::to_string(m_cfg.max_in_memory_bytes) +
+                         " (dataset has outgrown the in-memory Writer; "
+                         "wait for StreamingWriter or raise the cap)");
+    }
+
+    // Formal: file_size must fit in size_t before we allocate. Dead branch
+    // on 64-bit (size_t == uint64_t) but documents the invariant and would
+    // fire on 32-bit builds (which the spec forbids — this is a backstop).
+    if (file_size > std::numeric_limits<std::size_t>::max()) {
+        throw WriteError("Writer::finalize: file_size exceeds SIZE_MAX");
+    }
 
     // Allocate the entire file buffer (zero-filled so any padding bytes
     // between sections are deterministic).
@@ -215,12 +294,11 @@ void Writer::finalize(const std::filesystem::path& path) {
         write_u16_le(bytes, h.w_flat_offset + k * 2, m_w_flat[k]);
     }
 
-    // metadata trailer (UTF-8 JSON; spec §6)
-    if (!m_cfg.metadata_json.empty()) {
-        std::memcpy(bytes.data() + h.metadata_offset,
-                    m_cfg.metadata_json.data(),
-                    m_cfg.metadata_json.size());
-    }
+    // metadata trailer (UTF-8 JSON; spec §6) — always non-empty after
+    // the auto-fill above.
+    std::memcpy(bytes.data() + h.metadata_offset,
+                effective_metadata.data(),
+                effective_metadata.size());
 
     // Optional re-validation: catches any disagreement between writer
     // and validator (i.e., a writer bug).

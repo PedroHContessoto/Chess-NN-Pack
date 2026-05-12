@@ -38,8 +38,7 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
-# Test fixtures (large)
-test_data/*.binpack
-test_data/*.cnnp
-test_data/*.h5
+# Test fixtures (large datasets — never committed)
+test_data/**
 !test_data/.gitkeep
+!test_data/README.md

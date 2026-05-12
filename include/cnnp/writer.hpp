@@ -14,11 +14,26 @@
 //   * serializes a 256-byte header + all arrays in a single atomic write.
 //   * by default re-validates the produced file via validate_full().
 //
-// Memory note (V2 implementation): the entire dataset is buffered in
-// RAM until finalize(). Expect ≈ 4 + 2*avg_features bytes per position
-// for the per-position arrays, plus an equal-sized output buffer
-// allocated at finalize. A future API will add a streaming-w_flat
-// variant for datasets that exceed available memory.
+// **In-memory** (intended for tests, golden files, and small-to-medium
+// datasets up to a few hundred million positions). The entire dataset
+// is buffered in RAM until finalize() and a second buffer of equal size
+// is allocated for the output file image. Approximate peak RAM:
+//
+//     in-RAM arrays:    ~(8 + 2 * avg_features) bytes per position
+//     output buffer:    ~(8 + 2 * avg_features) bytes per position
+//     total peak:       ~16 + 4 * avg_features bytes per position
+//
+// For HalfP with avg_features ≈ 16:
+//
+//     100M positions  →  ~8 GB peak  (viable on 16+ GB workstations)
+//     500M positions  →  ~40 GB peak (need a high-RAM machine)
+//     2B  positions   →  ~160 GB peak (NOT viable; needs StreamingWriter)
+//
+// A future `StreamingWriter` will write the w_flat array directly to
+// disk while only buffering small per-position arrays + prefix/anchors
+// in RAM, capping peak memory below ~10 GB regardless of dataset size.
+// Use this `Writer` until then; if your dataset exceeds ~500M positions,
+// stop and ask for the streaming variant.
 
 #pragma once
 
@@ -74,6 +89,16 @@ struct WriterConfig {
     /// readable by the core Reader (the core does not parse JSON).
     std::string    metadata_json =
         R"({"format":"cnnp_sparse_v2","layout":"single_file"})";
+    /// Hard cap on the in-memory output buffer (bytes). If `finalize()`
+    /// computes a `file_size` greater than this, it throws `WriteError`
+    /// instead of trying to allocate. Use this as an explicit guardrail
+    /// when running on memory-constrained machines or when you suspect
+    /// your dataset has outgrown the in-memory writer.
+    /// `0` disables the check (default behavior). Recommended values:
+    ///   *  16 * (1ull << 30)  // 16 GB  — safe on 32 GB workstations
+    ///   *  64 * (1ull << 30)  // 64 GB  — high-RAM training rigs
+    /// Once the StreamingWriter exists, use that instead of raising the cap.
+    std::uint64_t  max_in_memory_bytes = 0;
 };
 
 // ─── Writer ──────────────────────────────────────────────────────────────────

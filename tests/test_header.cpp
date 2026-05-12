@@ -250,6 +250,14 @@ TEST(Header, RejectHasWdlGlobalZero) {
     EXPECT_THROW((void)parse_header(buf), ParseError);
 }
 
+TEST(Header, RejectNonZeroHeaderFlags) {
+    Header h = make_canonical_header();
+    std::vector<std::byte> buf(CNNP_HEADER_SIZE);
+    serialize_header(h, buf);
+    write_u16_le(buf, 74, 0x0001);  // V2 reserves header_flags entirely
+    EXPECT_THROW((void)parse_header(buf), ParseError);
+}
+
 TEST(Header, RejectNonZeroReservedByte15) {
     Header h = make_canonical_header();
     std::vector<std::byte> buf(CNNP_HEADER_SIZE);

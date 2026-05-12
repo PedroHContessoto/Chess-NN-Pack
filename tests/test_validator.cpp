@@ -186,6 +186,102 @@ TEST(Validator, GlobalFeatureCountMismatch) {
                  ValidationError);
 }
 
+// ─── New invariants (P0 + P1 hardening) ──────────────────────────────────────
+
+TEST(Validator, RejectMismatchedPieceCountAndNnz) {
+    auto v = make_valid_file(/*n=*/4, /*ppp=*/4);
+    // Tamper flags[0] to claim piece_count=8 (encoded stored=6, byte = 0x0C).
+    // Prefix delta for position 0 still says 4 (built by fixture).
+    v.bytes[v.header.flags_offset + 0] = std::byte{0x0C};
+    EXPECT_THROW(validate_full(v.header, std::span<const std::byte>(v.bytes)),
+                 ValidationError);
+}
+
+TEST(Validator, RejectNonZeroHeaderFlags) {
+    auto v = make_valid_file();
+    v.header.header_flags = 1;  // V2 reserved
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectNanFixedScale) {
+    auto v = make_valid_file();
+    v.header.fixed_scale = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectZeroFixedScale) {
+    auto v = make_valid_file();
+    v.header.fixed_scale = 0.0f;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectInfStorageTargetClip) {
+    auto v = make_valid_file();
+    v.header.storage_target_clip = std::numeric_limits<float>::infinity();
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectNegativeNormalEvalClip) {
+    auto v = make_valid_file();
+    v.header.normal_eval_clip = -1.0f;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectWrongVersion) {
+    auto v = make_valid_file();
+    v.header.version = 99;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectWrongBlockSize) {
+    auto v = make_valid_file();
+    v.header.block_size = 2048;
+    // recompute num_blocks so the consistency check between num_positions and
+    // num_blocks doesn't mask the block_size violation
+    v.header.num_blocks = 1;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectNonZeroShardId) {
+    auto v = make_valid_file();
+    v.header.shard_id = 1;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectMismatchedCountBase) {
+    auto v = make_valid_file();
+    v.header.count_base = 3;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, RejectInvalidMateEncoding) {
+    auto v = make_valid_file();
+    // OutBand (=2) is reserved for V3.
+    v.header.mate_encoding = MateEncoding::OutBand;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
+TEST(Validator, ExpectedBlocksFormulaIsOverflowSafe) {
+    auto v = make_valid_file();
+    // num_positions near UINT64_MAX. The OLD formula
+    //   (num_positions + block_size - 1) / block_size
+    // wraps; the new formula must NOT, and must report the violation
+    // (num_blocks fits u32 check) gracefully.
+    v.header.num_positions = std::numeric_limits<std::uint64_t>::max() - 100;
+    EXPECT_THROW(validate_header_consistency(v.header, v.bytes.size()),
+                 ValidationError);
+}
+
 // ─── Checked arithmetic helpers ──────────────────────────────────────────────
 
 TEST(CheckedArithmetic, AddNoOverflow) {

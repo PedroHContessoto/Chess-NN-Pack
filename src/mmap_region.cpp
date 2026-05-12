@@ -5,6 +5,8 @@
 #include "cnnp/mmap_region.hpp"
 
 #include <cstring>
+#include <limits>
+#include <type_traits>
 #include <utility>
 
 #ifdef _WIN32
@@ -64,6 +66,19 @@ MMapRegion::MMapRegion(const std::filesystem::path& path) {
         const DWORD err = ::GetLastError();
         close();
         throw MmapError("GetFileSizeEx failed: " + format_winerr(err));
+    }
+
+    // QuadPart is signed LONGLONG; defensively reject pathological values
+    // for parity with the POSIX path. Unreachable on a healthy NTFS but
+    // documents the invariant.
+    if (sz.QuadPart < 0) {
+        close();
+        throw MmapError("file size is negative (corrupt filesystem?)");
+    }
+    if (static_cast<std::uint64_t>(sz.QuadPart) >
+        std::numeric_limits<std::size_t>::max()) {
+        close();
+        throw MmapError("file too large for this process address space");
     }
 
     if (sz.QuadPart == 0) {
@@ -126,6 +141,20 @@ MMapRegion::MMapRegion(const std::filesystem::path& path) {
         const int e = errno;
         close();
         throw MmapError(std::string("fstat failed: ") + std::strerror(e));
+    }
+
+    // off_t is signed; defensively reject negative or oversized sizes that
+    // would wrap on the cast. Both are unreachable on real x86_64 but
+    // documenting the invariant prevents silent UB on weirder targets.
+    if (st.st_size < 0) {
+        close();
+        throw MmapError("file size is negative (corrupt filesystem?)");
+    }
+    using StSizeUnsigned = std::make_unsigned_t<decltype(st.st_size)>;
+    if (static_cast<StSizeUnsigned>(st.st_size) >
+        std::numeric_limits<std::size_t>::max()) {
+        close();
+        throw MmapError("file too large for this process address space");
     }
 
     if (st.st_size == 0) {

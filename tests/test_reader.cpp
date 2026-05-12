@@ -227,6 +227,30 @@ TEST(Reader, OpenUncheckedSkipsArrayValidation) {
     EXPECT_NO_THROW((void)Reader::open_unchecked(tmp.path()));
 }
 
+TEST(Reader, AtRejectsCorruptPrefixBeyondTotal) {
+    // Build a valid file then corrupt prefix[1] to a huge value so that
+    // (anchor + prefix[1]) exceeds num_features_total. open_unchecked()
+    // succeeds (per-array scans skipped) but at(0) must throw.
+    auto vf = make_valid_file(/*n=*/4, /*ppp=*/4);
+    cnnp::write_u16_le(vf.bytes, vf.header.block_prefix_offset + 2, 9999);
+    TempFile tmp(vf, "corrupt_prefix_oob");
+
+    auto r = Reader::open_unchecked(tmp.path());
+    EXPECT_THROW((void)r.at(0), std::runtime_error);
+}
+
+TEST(Reader, AtRejectsPieceCountMismatch) {
+    // Tamper flags[0] to claim piece_count=8 while the prefix delta is 4.
+    // open_unchecked succeeds but at(0) must reject the inconsistency.
+    auto vf = make_valid_file(/*n=*/4, /*ppp=*/4);
+    // encode_flags(stm=0, pc=8) → stored=6 → byte = (6<<1)|0 = 0x0C
+    vf.bytes[vf.header.flags_offset + 0] = std::byte{0x0C};
+    TempFile tmp(vf, "pc_mismatch");
+
+    auto r = Reader::open_unchecked(tmp.path());
+    EXPECT_THROW((void)r.at(0), std::runtime_error);
+}
+
 TEST(Reader, OpenUncheckedStillValidatesHeaderAlignment) {
     auto vf = make_valid_file();
     // Misalign eval_offset → header consistency must reject even in unchecked.

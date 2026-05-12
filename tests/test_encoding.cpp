@@ -146,10 +146,40 @@ TEST(EncodeEval, ClampsBeyondStorageTargetClip) {
     EXPECT_EQ(encode_eval(-12.0f), -30000);
 }
 
-TEST(EncodeEval, I16SafetyClampOnPathologicalParams) {
-    // Caller passes huge fixed_scale; encoder must still saturate at i16.
-    const std::int16_t i = encode_eval(1.0f, /*fixed_scale=*/100'000.0f, /*clip=*/100.0f);
-    EXPECT_EQ(i, std::numeric_limits<std::int16_t>::max());
+TEST(EncodeEval, RejectsPathologicalParams) {
+    // Replaces the previous "silent saturation" behavior. Per spec
+    // §7, a header with `storage_target_clip * fixed_scale > 32767`
+    // is invalid; the encoder mirrors that contract by throwing instead
+    // of silently saturating training data.
+    EXPECT_THROW((void)encode_eval(1.0f, /*fixed_scale=*/100'000.0f,
+                                   /*storage_target_clip=*/100.0f),
+                 cnnp::EncodeError);
+}
+
+TEST(EncodeEval, RejectsNanTarget) {
+    EXPECT_THROW((void)encode_eval(std::numeric_limits<float>::quiet_NaN()),
+                 cnnp::EncodeError);
+}
+
+TEST(EncodeEval, RejectsInfTarget) {
+    EXPECT_THROW((void)encode_eval(std::numeric_limits<float>::infinity()),
+                 cnnp::EncodeError);
+}
+
+TEST(EncodeEval, RejectsZeroFixedScale) {
+    EXPECT_THROW((void)encode_eval(1.0f, /*fixed_scale=*/0.0f),
+                 cnnp::EncodeError);
+}
+
+TEST(DecodeEval, RejectsZeroFixedScale) {
+    EXPECT_THROW((void)decode_eval(100, /*fixed_scale=*/0.0f),
+                 cnnp::EncodeError);
+}
+
+TEST(DecodeEval, RejectsNanFixedScale) {
+    EXPECT_THROW((void)decode_eval(100,
+                                   std::numeric_limits<float>::quiet_NaN()),
+                 cnnp::EncodeError);
 }
 
 TEST(EncodeEvalFromCp, FullPipelineWorks) {

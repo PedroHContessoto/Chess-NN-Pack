@@ -6,6 +6,7 @@
 #include "cnnp/encoding.hpp"  // for FLAGS_RESERVED / sentinel constants
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <sstream>
@@ -62,15 +63,108 @@ void must_mul(std::uint64_t a, std::uint64_t b, std::uint64_t& out, const char* 
 // ─── Header-only validation ──────────────────────────────────────────────────
 
 void validate_header_consistency(const Header& h, std::uint64_t file_size) {
-    // Basic sanity (parser enforces these too; cheap belt-and-suspenders)
+    // ─── V2 fixed-field invariants (spec §7 Header) ──────────────────────────
+    // These re-check what parse_header validates. They matter for in-memory
+    // Header structs (e.g., produced by Writer) that bypass the parser.
+    if (h.version != CNNP_VERSION) {
+        std::ostringstream os;
+        os << "version " << h.version << " != " << CNNP_VERSION << " (V2)";
+        fail(os.str());
+    }
+    if (h.header_size != CNNP_HEADER_SIZE) {
+        std::ostringstream os;
+        os << "header_size " << h.header_size << " != " << CNNP_HEADER_SIZE;
+        fail(os.str());
+    }
+    if (h.endian != Endian::Little) {
+        fail("endian != Little (V2 is little-endian only)");
+    }
+    if (h.layout_kind != LayoutKind::SingleFile) {
+        fail("layout_kind != SingleFile (V2)");
+    }
+    if (h.feature_set != FeatureSet::HalfP &&
+        h.feature_set != FeatureSet::HalfKAv2_hm &&
+        h.feature_set != FeatureSet::HalfKA) {
+        std::ostringstream os;
+        os << "feature_set value " << static_cast<int>(h.feature_set)
+           << " not in V2 set {HalfP=1, HalfKAv2_hm=2, HalfKA=3}";
+        fail(os.str());
+    }
+    if (h.count_semantics != CountSemantics::PieceCountEqualsNnz) {
+        fail("count_semantics != PieceCountEqualsNnz (V2)");
+    }
+    if (h.eval_encoding != EvalEncoding::Int16FixedNormalized) {
+        fail("eval_encoding != Int16FixedNormalized (V2)");
+    }
+    if (h.mate_encoding != MateEncoding::InBand &&
+        h.mate_encoding != MateEncoding::Saturate) {
+        std::ostringstream os;
+        os << "mate_encoding value " << static_cast<int>(h.mate_encoding)
+           << " not in V2 set {InBand=0, Saturate=1}";
+        fail(os.str());
+    }
+    if (h.flags_encoding != FlagsEncoding::StmPlusCountMinus2) {
+        fail("flags_encoding != StmPlusCountMinus2 (V2)");
+    }
+    if (h.has_eval_global != 1) fail("has_eval_global != 1 (V2: arrays always present)");
+    if (h.has_wdl_global  != 1) fail("has_wdl_global  != 1 (V2: arrays always present)");
+    if (h.shard_id              != 0) fail("shard_id != 0 (V2: single-file only)");
+    if (h.num_shards            != 1) fail("num_shards != 1 (V2: single-file only)");
+    if (h.global_position_start != 0) fail("global_position_start != 0 (V2)");
+    if (h.header_flags          != 0) {
+        std::ostringstream os;
+        os << "header_flags " << h.header_flags << " != 0 (V2: reserved, must be zero)";
+        fail(os.str());
+    }
+    if (h.block_size != CNNP_BLOCK_SIZE) {
+        std::ostringstream os;
+        os << "block_size " << h.block_size << " != " << CNNP_BLOCK_SIZE << " (V2)";
+        fail(os.str());
+    }
+    if (h.max_count != CNNP_MAX_COUNT) {
+        std::ostringstream os;
+        os << "max_count " << static_cast<int>(h.max_count)
+           << " != " << static_cast<int>(CNNP_MAX_COUNT) << " (V2)";
+        fail(os.str());
+    }
+    if (h.count_base != CNNP_COUNT_BASE) {
+        std::ostringstream os;
+        os << "count_base " << static_cast<int>(h.count_base)
+           << " != " << static_cast<int>(CNNP_COUNT_BASE) << " (V2)";
+        fail(os.str());
+    }
+
+    // ─── Float fields must be finite and positive ────────────────────────────
+    // Done BEFORE the bound check below: NaN comparisons against 32767 would
+    // silently return false, letting garbage through.
+    if (!std::isfinite(h.fixed_scale) || h.fixed_scale <= 0.0f) {
+        std::ostringstream os;
+        os << "fixed_scale must be finite and > 0; got " << h.fixed_scale;
+        fail(os.str());
+    }
+    if (!std::isfinite(h.normal_eval_clip) || h.normal_eval_clip <= 0.0f) {
+        std::ostringstream os;
+        os << "normal_eval_clip must be finite and > 0; got " << h.normal_eval_clip;
+        fail(os.str());
+    }
+    if (!std::isfinite(h.storage_target_clip) || h.storage_target_clip <= 0.0f) {
+        std::ostringstream os;
+        os << "storage_target_clip must be finite and > 0; got " << h.storage_target_clip;
+        fail(os.str());
+    }
+
+    // ─── Sanity ──────────────────────────────────────────────────────────────
     if (h.num_positions == 0) fail("num_positions == 0 (V2 forbids empty datasets)");
     if (h.num_blocks    == 0) fail("num_blocks == 0 (V2 forbids empty datasets)");
 
-    // num_blocks == ceil(num_positions / block_size)
+    // num_blocks == ceil(num_positions / block_size).
+    // Overflow-safe: avoids `num_positions + block_size - 1` wrapping for
+    // pathological inputs where num_positions is near UINT64_MAX.
     if (h.block_size == 0) fail("block_size == 0");
     {
         const std::uint64_t expected_blocks =
-            (h.num_positions + h.block_size - 1) / h.block_size;
+            h.num_positions / h.block_size +
+            ((h.num_positions % h.block_size) != 0 ? 1ull : 0ull);
         if (expected_blocks > std::numeric_limits<std::uint32_t>::max()) {
             std::ostringstream os;
             os << "num_blocks " << expected_blocks << " exceeds UINT32_MAX";
@@ -365,6 +459,35 @@ void validate_w_flat(std::span<const std::uint16_t> w_flat,
     }
 }
 
+void validate_counts_match_prefix(std::span<const std::uint8_t> flags,
+                                  std::span<const std::uint16_t> prefix,
+                                  const Header& h) {
+    // Caller guarantees: flags.size() == h.num_positions,
+    //                    prefix.size() == h.num_blocks * (block_size + 1),
+    //                    validate_flags_array has run (sentinel rejected).
+    constexpr std::uint8_t COUNT_MASK = 0x1F;
+    for (std::uint64_t i = 0; i < h.num_positions; ++i) {
+        const std::uint64_t b    = i / h.block_size;
+        const std::uint64_t j    = i % h.block_size;
+        const std::uint64_t base = b * (static_cast<std::uint64_t>(h.block_size) + 1ull);
+
+        const std::uint8_t  stored_count =
+            static_cast<std::uint8_t>((flags[i] >> 1) & COUNT_MASK);
+        const std::uint16_t piece_count  =
+            static_cast<std::uint16_t>(stored_count + h.count_base);
+        const std::uint16_t nnz =
+            static_cast<std::uint16_t>(prefix[base + j + 1] - prefix[base + j]);
+
+        if (nnz != piece_count) {
+            std::ostringstream os;
+            os << "position " << i << ": prefix nnz " << nnz
+               << " != flags piece_count " << piece_count
+               << " (count_semantics = piece_count_equals_nnz)";
+            fail(os.str());
+        }
+    }
+}
+
 // ─── Full validation ─────────────────────────────────────────────────────────
 
 namespace {
@@ -427,6 +550,9 @@ void validate_full(const Header& h, std::span<const std::byte> file_bytes) {
     validate_wdl_array(wdls);
     validate_block_prefix(anchors, prefix, h);
     validate_w_flat(w_flat, h.max_feature_id);
+    // Cross-check piece_count (flags) vs nnz (prefix delta) — runs after
+    // validate_flags_array so the sentinel is already rejected.
+    validate_counts_match_prefix(flags, prefix, h);
 }
 
 }  // namespace cnnp

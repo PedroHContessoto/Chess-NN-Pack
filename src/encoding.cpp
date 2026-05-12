@@ -97,28 +97,42 @@ float normalize_target(std::int32_t score_cp) noexcept {
 
 std::int16_t encode_eval(float target_normalized,
                          float fixed_scale,
-                         float storage_target_clip) noexcept {
-    // Clamp to spec-provided bounds first, then scale.
+                         float storage_target_clip) {
+    // Validate parameters loudly. Silent saturation on bad input is unsafe
+    // for training data — better to surface upstream bugs early.
+    if (!std::isfinite(target_normalized)) {
+        throw EncodeError("encode_eval: target_normalized must be finite");
+    }
+    if (!std::isfinite(fixed_scale) || fixed_scale <= 0.0f) {
+        throw EncodeError("encode_eval: fixed_scale must be finite and > 0");
+    }
+    if (!std::isfinite(storage_target_clip) || storage_target_clip <= 0.0f) {
+        throw EncodeError("encode_eval: storage_target_clip must be finite and > 0");
+    }
+    if (storage_target_clip * fixed_scale > 32767.0f) {
+        std::ostringstream os;
+        os << "encode_eval: storage_target_clip * fixed_scale = "
+           << (storage_target_clip * fixed_scale) << " > 32767 (i16 overflow)";
+        throw EncodeError(os.str());
+    }
+
     const float clamped = std::clamp(target_normalized,
                                      -storage_target_clip, storage_target_clip);
     const long  rounded = std::lroundf(clamped * fixed_scale);
-
-    // Final safety clamp to i16 range. With well-formed parameters
-    // (storage_target_clip * fixed_scale ≤ 32767), this is a no-op,
-    // but defends against pathological caller input.
-    constexpr long I16_MIN = -32768L;
-    constexpr long I16_MAX =  32767L;
-    const long final_v = std::clamp(rounded, I16_MIN, I16_MAX);
-    return static_cast<std::int16_t>(final_v);
+    // With validated parameters above, `rounded` cannot exceed i16 range.
+    return static_cast<std::int16_t>(rounded);
 }
 
-float decode_eval(std::int16_t eval_i16, float fixed_scale) noexcept {
+float decode_eval(std::int16_t eval_i16, float fixed_scale) {
+    if (!std::isfinite(fixed_scale) || fixed_scale <= 0.0f) {
+        throw EncodeError("decode_eval: fixed_scale must be finite and > 0");
+    }
     return static_cast<float>(eval_i16) / fixed_scale;
 }
 
 std::int16_t encode_eval_from_cp(std::int32_t score_cp,
                                  float fixed_scale,
-                                 float storage_target_clip) noexcept {
+                                 float storage_target_clip) {
     return encode_eval(normalize_target(score_cp), fixed_scale, storage_target_clip);
 }
 

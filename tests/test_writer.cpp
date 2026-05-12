@@ -349,10 +349,13 @@ TEST(Writer, MetadataCustomJsonRoundtrip) {
     EXPECT_EQ(0, std::memcmp(md.data(), cfg.metadata_json.data(), md.size()));
 }
 
-TEST(Writer, MetadataEmptyAllowed) {
-    TempPath tp("md_empty");
+TEST(Writer, MetadataEmptyTriggersDefault) {
+    // Spec §6 + §12 require a non-empty UTF-8 JSON trailer. The Writer
+    // auto-fills the spec minimum if the user supplies an empty string,
+    // so no path produces a non-conforming file.
+    TempPath tp("md_empty_default");
     WriterConfig cfg;
-    cfg.metadata_json.clear();
+    cfg.metadata_json.clear();  // user explicitly opts for "empty"
 
     std::vector<std::uint16_t> feats = {0, 1};
     Writer w(cfg);
@@ -360,11 +363,118 @@ TEST(Writer, MetadataEmptyAllowed) {
     w.finalize(tp.path());
 
     auto r = Reader::open(tp.path());
-    EXPECT_EQ(r.metadata().size(), 0u);
-    EXPECT_EQ(r.header().metadata_length, 0u);
-    // metadata_offset must still equal end of w_flat (file-end edge case)
-    EXPECT_EQ(r.header().metadata_offset,
-              r.header().w_flat_offset + r.header().num_features_total * 2);
+    const std::string expected =
+        R"({"format":"cnnp_sparse_v2","layout":"single_file"})";
+    auto md = r.metadata();
+    ASSERT_EQ(md.size(), expected.size());
+    EXPECT_EQ(0, std::memcmp(md.data(), expected.data(), expected.size()));
+}
+
+TEST(Writer, RejectsNanFixedScaleInConfig) {
+    WriterConfig cfg;
+    cfg.fixed_scale = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(Writer w(cfg), WriteError);
+}
+
+TEST(Writer, RejectsExceedingMaxInMemoryBytes) {
+    // Cap at 1024 bytes — far less than even one block's prefix (2050B).
+    WriterConfig cfg;
+    cfg.max_in_memory_bytes = 1024;
+
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("max_mem");
+    EXPECT_THROW(w.finalize(tp.path()), WriteError);
+}
+
+// ─── V2 fixed-field enforcement (fail-fast in ctor) ──────────────────────────
+
+TEST(Writer, RejectsNonV2BlockSizeInConfig) {
+    WriterConfig cfg;
+    cfg.block_size = 2048;  // V2 mandates 1024
+    EXPECT_THROW(Writer w(cfg), WriteError);
+}
+
+TEST(Writer, RejectsNonV2MaxCountInConfig) {
+    WriterConfig cfg;
+    cfg.max_count = 16;  // V2 mandates 32
+    EXPECT_THROW(Writer w(cfg), WriteError);
+}
+
+TEST(Writer, RejectsNonV2CountBaseInConfig) {
+    WriterConfig cfg;
+    cfg.count_base = 0;  // V2 mandates 2
+    EXPECT_THROW(Writer w(cfg), WriteError);
+}
+
+// ─── Metadata user-input validation ─────────────────────────────────────────
+
+TEST(Writer, RejectsMetadataNotJsonObject) {
+    WriterConfig cfg;
+    cfg.metadata_json = "not really json";
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("md_bad_shape");
+    EXPECT_THROW(w.finalize(tp.path()), WriteError);
+}
+
+TEST(Writer, RejectsMetadataMissingFormat) {
+    WriterConfig cfg;
+    cfg.metadata_json = R"({"layout":"single_file"})";  // no format field
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("md_no_format");
+    EXPECT_THROW(w.finalize(tp.path()), WriteError);
+}
+
+TEST(Writer, RejectsMetadataMissingLayout) {
+    WriterConfig cfg;
+    cfg.metadata_json = R"({"format":"cnnp_sparse_v2"})";  // no layout field
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("md_no_layout");
+    EXPECT_THROW(w.finalize(tp.path()), WriteError);
+}
+
+TEST(Writer, MetadataValidationDisabledWhenValidateFalse) {
+    // validate=false should let any metadata through (escape hatch).
+    WriterConfig cfg;
+    cfg.metadata_json = "totally not json";
+    cfg.validate      = false;
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("md_no_validate");
+    EXPECT_NO_THROW(w.finalize(tp.path()));
+    // The file is now non-conforming; cnnp validate (CLI) would reject it.
+}
+
+TEST(Writer, MaxInMemoryBytesZeroDisablesCheck) {
+    // Default (0) means unlimited — finalize succeeds for any reasonable size.
+    WriterConfig cfg;
+    cfg.max_in_memory_bytes = 0;
+
+    Writer w(cfg);
+    std::vector<std::uint16_t> feats = {0, 1};
+    w.add(0, 0, 0, 2, std::span<const std::uint16_t>(feats));
+
+    TempPath tp("max_mem_unlimited");
+    EXPECT_NO_THROW(w.finalize(tp.path()));
+}
+
+TEST(Writer, RejectsZeroStorageTargetClipInConfig) {
+    WriterConfig cfg;
+    cfg.storage_target_clip = 0.0f;
+    EXPECT_THROW(Writer w(cfg), WriteError);
 }
 
 TEST(Writer, MetadataFileSizeMatchesHeaderPlusTrailer) {

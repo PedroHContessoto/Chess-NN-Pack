@@ -206,6 +206,12 @@ Header parse_header(std::span<const std::byte> bytes) {
     if (h.has_wdl_global != 1) {
         throw_parse("V2 requires has_wdl_global == 1");
     }
+    if (h.header_flags != 0) {
+        // V2 reserves header_flags entirely; non-zero indicates a future
+        // version (or corruption) and must be rejected here, not just by
+        // the validator.
+        throw_parse("V2 requires header_flags == 0");
+    }
     if (read_u32_le(bytes, off::reserved_76) != 0) {
         throw_parse("reserved 4 bytes at offset 76 are non-zero");
     }

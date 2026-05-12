@@ -95,6 +95,20 @@ void validate_block_prefix(std::span<const std::uint64_t> anchors,
 void validate_w_flat(std::span<const std::uint16_t> w_flat,
                      std::uint32_t max_feature_id);
 
+/// Cross-check spec §5.1 + §5.5 invariant `count_semantics =
+/// piece_count_equals_nnz`: for every position `i`, the piece_count
+/// encoded in `flags[i]` MUST equal the local feature delta in the
+/// block prefix (`prefix[base + j + 1] - prefix[base + j]`).
+///
+/// Without this check, a corrupted file can have flags claiming N pieces
+/// while the prefix delivers M ≠ N features, silently breaking bucket
+/// selection and training. Callers MUST run `validate_flags_array()`
+/// first (sentinel handling lives there); this function assumes the
+/// stored count is in the legal range.
+void validate_counts_match_prefix(std::span<const std::uint8_t> flags,
+                                  std::span<const std::uint16_t> prefix,
+                                  const Header& h);
+
 // ─── Full validation ──────────────────────────────────────────────────────────
 //
 // Convenience: runs `validate_header_consistency` then derives typed

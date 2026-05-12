@@ -33,7 +33,7 @@
 //   anchors (8 bytes)   :  272..280    (round_up 272,8 = 272)
 //   prefix (2050 bytes) :  280..2330   (1*1025*2)
 //   w_flat (32 bytes)   : 2330..2362   (16 features * 2)
-//   metadata (empty)    : 2362..2362
+//   metadata (50 bytes) : 2362..2412   ({"format":"cnnp_sparse_v2","layout":"single_file"})
 //
 // flags  (stm | (pc-2)<<1):
 //   0x04, 0x05, 0x04, 0x05
@@ -49,6 +49,7 @@
 // anchors[0]  = 0   (single block)
 // prefix[0..4] = {0, 4, 8, 12, 16}; prefix[5..1024] = 16 (padding).
 // w_flat = {1, 2, 3, 4, ..., 16}.
+// metadata trailer = the 50 ASCII bytes of the minimal spec-compliant JSON.
 
 #include "cnnp/encoding.hpp"
 #include "cnnp/header.hpp"
@@ -117,13 +118,15 @@ unsigned char u8at(const std::vector<std::byte>& bytes, std::uint64_t off) {
 }
 
 // Canonical offsets for the golden dataset (see comment block above).
-constexpr std::uint64_t G_FLAGS_OFF   = 256;
-constexpr std::uint64_t G_EVAL_OFF    = 260;
-constexpr std::uint64_t G_WDL_OFF     = 268;
-constexpr std::uint64_t G_ANCHORS_OFF = 272;
-constexpr std::uint64_t G_PREFIX_OFF  = 280;
-constexpr std::uint64_t G_WFLAT_OFF   = 2330;
-constexpr std::uint64_t G_FILE_SIZE   = 2362;
+constexpr std::uint64_t G_FLAGS_OFF    = 256;
+constexpr std::uint64_t G_EVAL_OFF     = 260;
+constexpr std::uint64_t G_WDL_OFF      = 268;
+constexpr std::uint64_t G_ANCHORS_OFF  = 272;
+constexpr std::uint64_t G_PREFIX_OFF   = 280;
+constexpr std::uint64_t G_WFLAT_OFF    = 2330;
+constexpr std::uint64_t G_METADATA_OFF = 2362;
+constexpr std::uint64_t G_METADATA_LEN = 50;
+constexpr std::uint64_t G_FILE_SIZE    = G_METADATA_OFF + G_METADATA_LEN;  // 2412
 
 // Hand-built dataset (shared by all golden tests).
 struct GoldenInput {
@@ -147,12 +150,8 @@ GoldenInput make_input() {
 
 void write_golden_file(const std::filesystem::path& path) {
     const auto in = make_input();
-    // Disable the JSON trailer so the file matches the hand-derived
-    // 2362-byte layout exactly. Tests that exercise the trailer live
-    // in test_writer.cpp.
-    cnnp::WriterConfig cfg;
-    cfg.metadata_json.clear();
-    Writer w(cfg);
+    // Default WriterConfig: minimal spec-compliant JSON trailer = 50 bytes.
+    Writer w;
     for (std::size_t i = 0; i < in.features.size(); ++i) {
         w.add(in.cps[i], in.wdls[i], in.stms[i],
               static_cast<std::uint8_t>(in.features[i].size()),
@@ -235,6 +234,16 @@ TEST(Golden, WriterProducesExpectedBytes) {
         EXPECT_EQ(u8at(bytes, G_WFLAT_OFF + (k - 1) * 2 + 1), 0x00u)
             << "w_flat[" << (k - 1) << "] hi";
     }
+
+    // ── metadata trailer (UTF-8 JSON, 50 bytes)
+    const std::string expected_metadata =
+        R"({"format":"cnnp_sparse_v2","layout":"single_file"})";
+    ASSERT_EQ(expected_metadata.size(), G_METADATA_LEN);
+    for (std::size_t k = 0; k < expected_metadata.size(); ++k) {
+        EXPECT_EQ(u8at(bytes, G_METADATA_OFF + k),
+                  static_cast<unsigned char>(expected_metadata[k]))
+            << "metadata byte " << k;
+    }
 }
 
 // ─── (B) parse_header + validate_full accept the canonical file ──────────────
@@ -258,8 +267,8 @@ TEST(Golden, ParseHeaderRecoversCanonicalLayout) {
     EXPECT_EQ(h.block_anchors_offset, G_ANCHORS_OFF);
     EXPECT_EQ(h.block_prefix_offset,  G_PREFIX_OFF);
     EXPECT_EQ(h.w_flat_offset,        G_WFLAT_OFF);
-    EXPECT_EQ(h.metadata_offset,      G_FILE_SIZE);
-    EXPECT_EQ(h.metadata_length,      0u);
+    EXPECT_EQ(h.metadata_offset,      G_METADATA_OFF);
+    EXPECT_EQ(h.metadata_length,      G_METADATA_LEN);
 
     EXPECT_NO_THROW(validate_full(h, std::span<const std::byte>(bytes)));
 }

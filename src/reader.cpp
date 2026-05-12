@@ -73,7 +73,28 @@ PositionView Reader::at(std::uint64_t i) const {
     const std::uint64_t start  = anchor + m_prefix[prefix_base + pos_in_block];
     const std::uint64_t end    = anchor + m_prefix[prefix_base + pos_in_block + 1];
 
+    // Defensive bounds: validate_full() in open() already enforces these,
+    // but open_unchecked() skips per-array scans. Without these checks a
+    // corrupt prefix could produce a span pointing outside the mmap.
+    if (end < start || end > m_header.num_features_total) {
+        throw std::runtime_error("Reader::at: corrupt feature slice at position " +
+                                 std::to_string(i) + " (start=" +
+                                 std::to_string(start) + " end=" +
+                                 std::to_string(end) + " total=" +
+                                 std::to_string(m_header.num_features_total) + ")");
+    }
+
     const DecodedFlags df = decode_flags(m_flags[i]);
+    const std::uint64_t len = end - start;
+
+    // count_semantics = piece_count_equals_nnz (spec §5): the prefix delta
+    // must equal what flags claim. Catches header/array desync in unchecked path.
+    if (len != df.piece_count) {
+        throw std::runtime_error("Reader::at: nnz/piece_count mismatch at position " +
+                                 std::to_string(i) + " (prefix delta=" +
+                                 std::to_string(len) + ", flags piece_count=" +
+                                 std::to_string(df.piece_count) + ")");
+    }
 
     PositionView view{};
     view.eval_normalized = decode_eval(m_eval[i], m_header.fixed_scale);
@@ -81,7 +102,7 @@ PositionView Reader::at(std::uint64_t i) const {
     view.piece_count     = df.piece_count;
     view.wdl             = m_wdl[i];
     view.features        = std::span<const std::uint16_t>(
-        m_w_flat + start, static_cast<std::size_t>(end - start));
+        m_w_flat + start, static_cast<std::size_t>(len));
     return view;
 }
 
