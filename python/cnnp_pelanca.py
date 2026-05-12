@@ -15,7 +15,12 @@ HDF5 sparse_v1 file into RAM as numpy arrays and exposes:
     stm          : uint8[n]       side to move (0=white, 1=black)
     piece_count  : uint8[n]       2..32
     offsets      : int64[n+1]     prefix sum into w_flat (CSR)
-    w_flat       : int16[total_f] feature ids (white-POV HalfP)
+    w_flat       : uint16[total_f] feature ids (white-POV HalfP). Stored as
+                                  uint16 (CNNP native) instead of int16 to
+                                  avoid a 38 GB astype copy on huge datasets.
+                                  Downstream code that does
+                                  `ds.w_flat[flat].astype(np.int64)` works
+                                  identically — values 0..767 fit either dtype.
     mirror       : bool           horizontal-mirror augmentation flag
 
 `CnnpPelancaDataset` exposes the SAME public surface but reads from one
@@ -139,60 +144,92 @@ class CnnpPelancaDataset:
         self.piece_count = np.empty(total_n, dtype=np.uint8)
         self.offsets     = np.empty(total_n + 1, dtype=np.int64)
         self.offsets[0]  = 0
-        self.w_flat      = np.empty(total_w, dtype=np.int16)
+        # uint16 (matches CNNP native) instead of int16 — avoids a 2x peak
+        # on .astype during huge-dataset loads. Downstream code casts to
+        # int64 anyway for indexing, so the dtype change is transparent.
+        self.w_flat      = np.empty(total_w, dtype=np.uint16)
 
-        # ─── Second pass: copy + derive ───────────────────────────────────
+        # Chunk sizes for the load loop. These cap the size of any
+        # numpy temporary during the cast/where/divide operations,
+        # keeping peak memory close to the final array size + ~1 GB.
+        POS_CHUNK = 50_000_000        # 50M positions per chunk (~200 MB temp)
+        W_CHUNK   = 200_000_000       # 200M features per chunk (~400 MB temp)
+
+        # ─── Second pass: copy + derive (chunked, in-place where possible) ─
         n_off = 0
         w_off = 0
         for r, n_take, w_take in zip(readers, per_file_n, per_file_w):
             if n_take == 0:
                 continue
 
-            # Per-position fields
-            flags_full = r.flags_array()         # zero-copy uint8 view
-            flags = np.array(flags_full[:n_take], copy=True)
-            self.stm[n_off:n_off + n_take] = flags & 0x01
-            self.piece_count[n_off:n_off + n_take] = ((flags >> 1) & 0x1F) + 2
+            # Cache cnnp views (zero-copy refs into the mmap)
+            flags_view  = r.flags_array()
+            eval_view   = r.eval_array()
+            wdl_view    = r.wdl_array()
+            wflat_view  = r.w_flat()
+            anchors_view = r.block_anchors()
+            prefix_view  = r.block_prefix()
+            fixed_scale  = float(r.header["fixed_scale"])
+            BS           = int(r.header["block_size"])
 
-            # Eval: CNNP stores STM-POV → invert to WHITE-POV for v25
-            evals_raw = np.array(r.eval_array()[:n_take], copy=True)  # int16
-            fixed_scale = float(r.header["fixed_scale"])
-            evals_norm = evals_raw.astype(np.float32) / fixed_scale
-            black = (flags & 0x01) == 1
-            evals_white = np.where(black, -evals_norm, evals_norm)
-            self.evals[n_off:n_off + n_take] = evals_white
+            # Process per-position fields in chunks (caps temporaries)
+            for cs in range(0, n_take, POS_CHUNK):
+                ce = min(cs + POS_CHUNK, n_take)
+                gs = slice(n_off + cs, n_off + ce)
 
-            # WDL: already white-POV in CNNP, just cast
-            self.wdl[n_off:n_off + n_take] = (
-                np.array(r.wdl_array()[:n_take], copy=True).astype(np.float32))
+                # Flags → stm + piece_count (in-place arithmetic into target)
+                flags_chunk = np.array(flags_view[cs:ce], copy=True)  # ~50 MB
+                np.bitwise_and(flags_chunk, 0x01, out=self.stm[gs])
+                pc_tmp = (flags_chunk >> 1) & 0x1F
+                np.add(pc_tmp, 2, out=self.piece_count[gs], casting='unsafe')
 
-            # Offsets: derive from anchors + prefix
-            BS = int(r.header["block_size"])
-            anchors = np.array(r.block_anchors(), copy=True).astype(np.int64)
-            prefix  = np.array(r.block_prefix(),  copy=True).astype(np.int64)
+                # Eval: int16 → float32 / fixed_scale, with STM-POV → white-POV flip
+                eraw = np.array(eval_view[cs:ce], copy=True)         # int16, ~100 MB
+                etmp = eraw.astype(np.float32)                       # float32, ~200 MB
+                etmp /= fixed_scale                                  # in-place
+                # Invert eval where stm == 1 (CNNP STM-POV → white-POV)
+                black_mask = (flags_chunk & 0x01).astype(bool)
+                etmp[black_mask] *= -1                               # in-place
+                self.evals[gs] = etmp
 
-            # Vectorised: position i starts at anchors[i//BS] + prefix[(i//BS)*(BS+1) + i%BS]
+                # WDL: int8 → float32 directly (numpy handles cast on assign)
+                self.wdl[gs] = wdl_view[cs:ce]
+
+                del flags_chunk, eraw, etmp, pc_tmp, black_mask
+
+            gc.collect()  # release the per-position temporaries
+
+            # Offsets: derive from anchors + prefix (small enough not to chunk;
+            # ~10 MB anchors + 4 GB prefix at 1B positions, but we only touch
+            # them as int64 indices). For 1B: works in one vectorised pass.
+            anchors_arr = np.array(anchors_view, copy=True).astype(np.int64)
+            prefix_arr  = np.array(prefix_view,  copy=True).astype(np.int64)
             i = np.arange(n_take, dtype=np.int64)
             b = i // BS
             j = i % BS
-            local_starts = anchors[b] + prefix[b * (BS + 1) + j]
-            # End of last position = START of (n_take), needed for offsets[n_off+n_take]
+            local_starts = anchors_arr[b] + prefix_arr[b * (BS + 1) + j]
             last_b = (n_take - 1) // BS
             last_j_plus_1 = (n_take - 1) % BS + 1
-            local_end = (int(anchors[last_b])
-                         + int(prefix[last_b * (BS + 1) + last_j_plus_1]))
+            local_end = (int(anchors_arr[last_b])
+                         + int(prefix_arr[last_b * (BS + 1) + last_j_plus_1]))
 
             self.offsets[n_off:n_off + n_take] = local_starts + w_off
             self.offsets[n_off + n_take]       = local_end + w_off
+            del anchors_arr, prefix_arr, local_starts, i, b, j
+            gc.collect()
 
-            # w_flat slice (uint16 in CNNP → int16 here; safe for HalfP ≤ 768)
-            wflat_view = r.w_flat()[:w_take]
-            self.w_flat[w_off:w_off + w_take] = wflat_view.astype(np.int16)
+            # w_flat: chunked copy (uint16 → uint16, no cast required).
+            # Direct assignment from mmap view to target slice; numpy
+            # internally does memcpy without allocating an intermediate.
+            for ws in range(0, w_take, W_CHUNK):
+                we = min(ws + W_CHUNK, w_take)
+                self.w_flat[w_off + ws:w_off + we] = wflat_view[ws:we]
 
             n_off += n_take
             w_off += w_take
-            del flags, flags_full, evals_raw, evals_norm, anchors, prefix
-            del local_starts, wflat_view
+            del flags_view, eval_view, wdl_view, wflat_view
+            del anchors_view, prefix_view
+            gc.collect()
 
         # Sanity: totals match
         assert n_off == total_n
