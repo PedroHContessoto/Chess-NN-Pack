@@ -24,6 +24,8 @@ import time
 from typing import Dict, Iterator
 
 import numpy as np
+import torch
+from torch.utils.data import IterableDataset
 
 import cnnp
 
@@ -32,38 +34,43 @@ PADDING_SENTINEL = 65535  # UINT16_MAX — what get_batch() uses for unused slot
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
 
-class CNNPBatchedDataset:
+class CNNPBatchedDataset(IterableDataset):
     """IterableDataset that yields full batches via Reader.get_batch().
 
     Use with `DataLoader(..., batch_size=None)` so PyTorch doesn't try to
     re-batch (each `__iter__` step already returns a complete batch).
 
-    Multi-worker safe: each worker handles a disjoint stride of batches.
+    Multi-worker safe: the reader is opened LAZILY in `__iter__`, so each
+    DataLoader worker process gets its own mmap (the Reader holds an OS
+    file handle that can't be pickled across the worker fork/spawn).
+    Each worker handles a disjoint stride of batches.
     """
 
     def __init__(self, path: str, batch_size: int = 16384,
                  shuffle: bool = True, seed: int = 0):
+        super().__init__()
         self.path = path
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
-        # validate=False: trust the file (validation already happened at
-        # convert time). Saves ~500ms on every worker startup.
-        self.reader = cnnp.Reader(path, validate=False)
+        # Cache the position count so __len__ works without opening the
+        # reader in every worker. The temporary reader is GC'd at the end
+        # of this expression.
+        self._num_positions = cnnp.Reader(path, validate=False).num_positions
 
     def __len__(self) -> int:
-        return (self.reader.num_positions + self.batch_size - 1) // self.batch_size
+        return (self._num_positions + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
-        try:
-            import torch
-            info = torch.utils.data.get_worker_info()
-            worker_id    = info.id          if info is not None else 0
-            num_workers  = info.num_workers if info is not None else 1
-        except ImportError:
-            worker_id, num_workers = 0, 1
+        # Open the reader fresh per __iter__ — works for num_workers=0
+        # (single-process) and num_workers>0 (one reader per worker).
+        reader = cnnp.Reader(self.path, validate=False)
 
-        N = self.reader.num_positions
+        info = torch.utils.data.get_worker_info()
+        worker_id   = info.id          if info is not None else 0
+        num_workers = info.num_workers if info is not None else 1
+
+        N = reader.num_positions
         rng = np.random.default_rng(self.seed + worker_id)
         indices = rng.permutation(N) if self.shuffle else np.arange(N, dtype=np.int64)
 
@@ -74,7 +81,7 @@ class CNNPBatchedDataset:
             chunk = indices[start:start + self.batch_size]
             if len(chunk) == 0:
                 break
-            yield self.reader.get_batch(chunk.astype(np.uint64))
+            yield reader.get_batch(chunk.astype(np.uint64))
 
 
 # ─── Tiny NNUE-flavored model (just to exercise GPU compute) ─────────────────
