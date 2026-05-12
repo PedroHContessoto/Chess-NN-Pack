@@ -18,8 +18,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>      // std::memcmp (GCC requires explicit include; MSVC pulls transitively)
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
