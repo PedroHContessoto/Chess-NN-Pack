@@ -139,10 +139,12 @@ private:
     WriterConfig m_cfg;
 
     // Per-position arrays (one entry per add() call).
+    // Note: piece_count / nnz is NOT stored separately — it's derivable
+    // from m_flags via `((flags >> 1) & 0x1F) + count_base`. Keeping it
+    // duplicated would waste 2 bytes/position × dataset size.
     std::vector<std::uint8_t>  m_flags;
     std::vector<std::int16_t>  m_eval;
     std::vector<std::int8_t>   m_wdl;
-    std::vector<std::uint16_t> m_per_pos_nnz;  // features.size() per position
 
     // Concatenated feature ids in add() order.
     std::vector<std::uint16_t> m_w_flat;

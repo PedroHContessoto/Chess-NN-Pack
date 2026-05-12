@@ -34,6 +34,22 @@ constexpr std::uint64_t round_up(std::uint64_t v, std::uint64_t a) {
     return (v + (a - 1)) & ~(a - 1);
 }
 
+// Decode the piece_count (== nnz under V2 count_semantics) directly from
+// a flags byte: bit 0 is stm, bits 1-5 are count_minus_count_base.
+// Avoids storing a redundant `m_per_pos_nnz` vector — for large datasets
+// (1B+ positions) that's 2 GB of wasted RAM.
+inline std::uint16_t nnz_from_flags(std::uint8_t flags,
+                                    std::uint8_t count_base) {
+    constexpr std::uint8_t SENTINEL = 31;
+    const std::uint8_t stored = static_cast<std::uint8_t>((flags >> 1) & 0x1F);
+    if (stored == SENTINEL) {
+        // Unreachable in practice: encode_flags() rejects piece_count >= 33,
+        // so stored count == 31 never gets pushed. Defensive only.
+        throw WriteError("Writer: invalid count sentinel in flags byte");
+    }
+    return static_cast<std::uint16_t>(stored + count_base);
+}
+
 }  // anonymous namespace
 
 // ─── Construction ────────────────────────────────────────────────────────────
@@ -122,7 +138,6 @@ void Writer::add(std::int32_t score_cp, std::int32_t wdl,
     m_flags.push_back(flags_byte);
     m_eval.push_back(eval_i16);
     m_wdl.push_back(wdl_i8);
-    m_per_pos_nnz.push_back(static_cast<std::uint16_t>(features.size()));
     m_w_flat.insert(m_w_flat.end(), features.begin(), features.end());
 }
 
@@ -151,7 +166,8 @@ void Writer::finalize(const std::filesystem::path& path) {
 
     // Per-block invariant: sum of nnz in any block must fit in u16.
     // With block_size=1024 and max_count=32, max sum = 32768 — but we
-    // verify defensively in case the config was relaxed.
+    // verify defensively in case the config was relaxed. nnz is derived
+    // from m_flags (no separate vector kept).
     {
         std::uint64_t pos_idx = 0;
         for (std::uint32_t b = 0; b < h.num_blocks; ++b) {
@@ -159,7 +175,7 @@ void Writer::finalize(const std::filesystem::path& path) {
             const std::uint64_t block_end = std::min<std::uint64_t>(
                 pos_idx + h.block_size, h.num_positions);
             for (std::uint64_t i = pos_idx; i < block_end; ++i) {
-                local_sum += m_per_pos_nnz[i];
+                local_sum += nnz_from_flags(m_flags[i], h.count_base);
             }
             if (local_sum > 65535u) {
                 throw WriteError("Writer::finalize: block " +
@@ -261,7 +277,7 @@ void Writer::finalize(const std::filesystem::path& path) {
         bytes[h.wdl_offset + i] = std::byte{static_cast<std::uint8_t>(m_wdl[i])};
     }
 
-    // anchors + prefix (computed from m_per_pos_nnz)
+    // anchors + prefix (nnz derived from m_flags; no separate vector)
     std::uint64_t running_features = 0;
     std::uint64_t pos_idx = 0;
     for (std::uint32_t b = 0; b < h.num_blocks; ++b) {
@@ -277,7 +293,8 @@ void Writer::finalize(const std::filesystem::path& path) {
 
         std::uint16_t local = 0;
         for (std::uint64_t j = 0; j < pos_in_block; ++j) {
-            local = static_cast<std::uint16_t>(local + m_per_pos_nnz[pos_idx + j]);
+            local = static_cast<std::uint16_t>(
+                local + nnz_from_flags(m_flags[pos_idx + j], h.count_base));
             write_u16_le(bytes, prefix_base + (j + 1) * 2, local);
         }
         // padding: repeat the last valid prefix value
@@ -327,7 +344,6 @@ void Writer::finalize(const std::filesystem::path& path) {
     m_flags.clear();
     m_eval.clear();
     m_wdl.clear();
-    m_per_pos_nnz.clear();
     m_w_flat.clear();
 }
 

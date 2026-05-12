@@ -226,6 +226,34 @@ faster than calling `at(i)` in a Python loop**:
 For batch=65536 this drops data-fetch from 757 ms (GPU starves) to 14.8 ms
 (GPU saturated by typical 50–200 ms forward+backward step).
 
+### PyTorch DataLoader integration
+
+[`examples/python/cnnp_dataset.py`](examples/python/cnnp_dataset.py)
+shows a complete `IterableDataset` + DataLoader integration plus a
+self-contained benchmark. End-to-end measurements on the 50M-position
+T76 file (2.1 GB cnnp):
+
+| Configuration | Phase | Throughput | Per-batch breakdown |
+|---|---|---:|---|
+| batch=16384, 1000 batches | data-only | **2.01 M pos/s** | 8.16 ms fetch (steady-state) |
+| batch=16384, 1000 batches | full loop on GTX 1050 | 0.23 M pos/s | fetch 9.79 ms (14%) / compute 61.75 ms (86%) — **GPU-bound** ✓ |
+| batch=65536, 250 batches | data-only | 1.66 M pos/s | 39.54 ms (slightly slower per pos due to 4 MB output buffer overflowing L2) |
+| batch=65536, 250 batches | full loop on CPU | 0.03 M pos/s | fetch 45.66 ms (2%) / compute 1907 ms (98%) — CPU obviously compute-bound |
+
+For the typical NNUE training range (batch=8k–32k on a modern GPU),
+data fetch sustains **~2 M pos/s** and consumes roughly 5–10 ms per
+batch — well under the typical 50–200 ms forward+backward step on
+A100/H100. The pipeline does NOT need `num_workers > 0` for most
+real workloads.
+
+Run it yourself:
+
+```sh
+PYTHONPATH=build/python python examples/python/cnnp_dataset.py \
+    --cnnp test_data/farseerT76_50m.cnnp \
+    --batch-size 16384 --max-batches 1000
+```
+
 ### Write a file
 
 ```cpp
@@ -277,6 +305,9 @@ python/
 tools/binpack_to_cnnp/
   binpack_to_cnnp.cpp   GPL-3.0 — converter using vendored nnue-pytorch
   README.md             explains the GPL/MIT isolation
+
+examples/python/
+  cnnp_dataset.py       PyTorch DataLoader integration + benchmark
 
 tests/
   test_header.cpp       23 tests — wire layout, parse/serialize, rejection paths
