@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d//**)",
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile \"D:/Chess-NN-Pack/examples/python/train_nnue.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"D:/Chess-NN-Pack/examples/python/train_nnue.py\" --help)"
+    ]
+  }
+}
