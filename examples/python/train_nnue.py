@@ -109,6 +109,7 @@ class TrainConfig:
     # I/O
     train_cnnp: str = ''
     val_cnnp: Optional[str] = None
+    val_indices_path: Optional[str] = None  # .npy file of sorted int64 val indices
     val_frac: float = 0.02
     val_max_pos: int = 500_000
     output_dir: str = 'runs/default'
@@ -828,18 +829,52 @@ def prepare_split(cfg: TrainConfig) -> Tuple[int, np.ndarray, str]:
     materialized as a single array (the streaming sampler walks them by
     chunk). If val came from the same file, the trainer excludes val_indices
     per-chunk via searchsorted.
+
+    Resolution priority:
+      1. `--val-indices PATH` — explicit fixed val set (preferred for
+         reproducible ablations; pins val regardless of --seed).
+      2. `--val PATH.cnnp` — separate val file (uses prefix of size
+         min(val_max_pos, |val_file|)).
+      3. default — random split from train via Floyd sampling.
     """
     train_r = cnnp.Reader(cfg.train_cnnp, validate=False)
     n_train = int(train_r.num_positions)
 
+    # Priority 1: explicit fixed val_indices file
+    if cfg.val_indices_path:
+        val_indices = np.load(cfg.val_indices_path)
+        val_indices = np.asarray(val_indices, dtype=np.int64)
+        if len(val_indices) == 0:
+            raise ValueError(f'val_indices file is empty: {cfg.val_indices_path}')
+        if int(val_indices.min()) < 0:
+            raise ValueError(
+                f'val_indices file contains negative indices '
+                f'(min={int(val_indices.min())}): {cfg.val_indices_path}')
+        if int(val_indices.max()) >= n_train:
+            raise ValueError(
+                f'val_indices file has max={int(val_indices.max())} but '
+                f'train cnnp has {n_train} positions — index out of range. '
+                f'Was the file generated for a different dataset size?')
+        # Defensive: sort and reject duplicates outright (better to fail loud
+        # than to silently train against duplicated val positions).
+        val_indices = np.sort(val_indices)
+        if len(val_indices) > 1 and not (np.diff(val_indices) > 0).all():
+            raise ValueError(
+                f'val_indices file contains duplicates: {cfg.val_indices_path}')
+        # Return train_cnnp as-is so downstream comparisons
+        # (`val_path == cfg.train_cnnp`) keep working and the val loader
+        # opens a real file. The val_indices source is logged separately.
+        return n_train, val_indices, cfg.train_cnnp
+
+    # Priority 2: separate val file
     if cfg.val_cnnp and cfg.val_cnnp != cfg.train_cnnp:
         val_r = cnnp.Reader(cfg.val_cnnp, validate=False)
         n_val_avail = int(val_r.num_positions)
         n_val = min(cfg.val_max_pos, n_val_avail) if cfg.val_max_pos > 0 else n_val_avail
         return n_train, np.arange(n_val, dtype=np.int64), cfg.val_cnnp
 
+    # Priority 3: random split via Floyd (default)
     n_val = min(cfg.val_max_pos, int(n_train * cfg.val_frac))
-    # Contractually O(n_val), not O(n_train) — see sample_unique_sorted().
     val_indices = sample_unique_sorted(n_train, n_val, cfg.seed)
     return n_train, val_indices, cfg.train_cnnp
 
@@ -974,6 +1009,12 @@ def parse_args():
     p.add_argument('--val', default=None,
                    help='Path to validation .cnnp (default: random split from --train; '
                         'pass a separate file for datasets ≥ 100M positions)')
+    p.add_argument('--val-indices', default=None,
+                   help='Path to .npy file with sorted int64 val indices into --train. '
+                        'Overrides --val and --val-frac/--val-max-pos. Use for '
+                        'reproducible ablations where the val set must stay fixed '
+                        'across runs with different --seed values. Generate one with '
+                        'examples/python/make_val_splits.py.')
     p.add_argument('--val-frac',    type=float, default=0.02)
     p.add_argument('--val-max-pos', type=int,   default=500_000)
     p.add_argument('--output',      default='runs/default')
@@ -998,6 +1039,10 @@ def parse_args():
     p.add_argument('--no-mirror',         action='store_true')
     p.add_argument('--no-material-init',  action='store_true')
     p.add_argument('--no-amp',            action='store_true')
+    p.add_argument('--bucket-weights',    choices=['default', 'uniform'], default='default',
+                   help='Bucket loss weights. "default" uses the MD-focused profile '
+                        '[1,1,1.2,1.5,2,2,1.5,1]; "uniform" disables weighting (all 1.0). '
+                        'Use uniform to ablate whether the default profile actually helps.')
 
     # Streaming sampler
     p.add_argument('--chunk-size',        type=int, default=1_048_576,
@@ -1020,9 +1065,11 @@ def parse_args():
 
 
 def args_to_config(args) -> TrainConfig:
+    bw = (1.0,) * 8 if args.bucket_weights == 'uniform' else TrainConfig.bucket_weights
     return TrainConfig(
         train_cnnp=args.train,
         val_cnnp=args.val,
+        val_indices_path=args.val_indices,
         val_frac=args.val_frac,
         val_max_pos=args.val_max_pos,
         output_dir=args.output,
@@ -1038,6 +1085,7 @@ def args_to_config(args) -> TrainConfig:
         ema_decay=args.ema_decay,
         eval_scale=args.eval_scale,
         wdl_weight_max=0.0 if args.no_wdl else args.wdl_weight,
+        bucket_weights=bw,
         mirror_aug=not args.no_mirror,
         material_init=not args.no_material_init,
         use_amp=not args.no_amp,
@@ -1093,7 +1141,12 @@ def main():
         log('  validation OK')
 
     n_train, val_idx, val_path = prepare_split(cfg)
-    split_note = ' (split from train, exclusion per chunk)' if val_path == cfg.train_cnnp else ''
+    if cfg.val_indices_path:
+        split_note = f' (fixed val: {cfg.val_indices_path}, exclusion per chunk)'
+    elif val_path == cfg.train_cnnp:
+        split_note = ' (random split from train, exclusion per chunk)'
+    else:
+        split_note = ''
     # When val is split from the same file, train excludes those indices
     # — account for that in the reported epoch size.
     effective_train_positions = (n_train - len(val_idx)
