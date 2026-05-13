@@ -42,3 +42,10 @@ Thumbs.db
 test_data/**
 !test_data/.gitkeep
 !test_data/README.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Training runs (artifacts — checkpoints, logs, exported .nnue files)
+runs/
